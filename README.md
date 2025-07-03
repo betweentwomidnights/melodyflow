@@ -8,7 +8,7 @@ this service transforms input audio while retaining bpm and chord structure. gre
 
 - **audio transformation**: takes input audio and transforms it based on text prompts or presets
 - **style preservation**: maintains bpm and chord structure during transformation  
-- **preset variations**: predefined transformations in `variations.py`
+- **preset variations**: predefined transformations in `variations.py` (still figuring out what works best)
 - **custom prompts**: supports custom text-based transformations
 - **progress tracking**: real-time progress updates via websockets
 
@@ -17,7 +17,7 @@ this service transforms input audio while retaining bpm and chord structure. gre
 this container includes a modified audiocraft repository pulled from:
 https://huggingface.co/spaces/facebook/melodyflow
 
-this version seems to have breaking changes to musicgen functionality, which is why melodyflow requires its own container separate from the main gary backend. it might also explain why meta has not yet integrated melodyflow into the official audiocraft repository.
+this version seems to have breaking changes to musicgen functionality, which is why melodyflow requires its own container separate from the main gary backend. it might also explain why meta hasn't integrated melodyflow into the official audiocraft repository yet.
 
 ## building
 
@@ -47,7 +47,7 @@ curl -X POST http://localhost:8002/transform \
   -d '{
     "audio": "base64_encoded_audio_data", 
     "variation": "custom",
-    "custom_prompt": "aggressive metal guitar",
+    "custom_prompt": "808 bass",
     "session_id": "test_session"
   }'
 ```
@@ -66,7 +66,7 @@ this service includes internal RQ (redis queue) worker functionality for job man
 ## integration with gary backend
 
 in the gary ecosystem:
-- transforms noisy musicgen continuations into cleaner audio
+- transforms noisy musicgen continuations into cool shit
 - enables style transfer between different musical genres
 - maintains tempo alignment with ableton projects
 - works alongside the main websockets backend via the queue service
