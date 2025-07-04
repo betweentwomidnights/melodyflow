@@ -23,7 +23,7 @@ python3 melodyflow_worker.py &
 worker_pid=$!
 
 echo "Starting MelodyFlow service..."
-python3 flask_melodyflow_2.py &
+python3 spaces_melodyflow.py &
 flask_pid=$!
 
 # Wait for any process to exit
