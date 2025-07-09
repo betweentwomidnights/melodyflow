@@ -25,10 +25,9 @@ COPY requirements-melodyflow.txt .
 RUN pip3 install -r requirements-melodyflow.txt waitress
 
 # Copy necessary files from your local MelodyFlow directory
-COPY flask_melodyflow_2.py .
+COPY spaces_melodyflow.py .
 COPY variations.py .
 COPY audiocraft ./audiocraft
-COPY melodyflow_worker.py .
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

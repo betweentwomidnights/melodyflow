@@ -18,10 +18,6 @@ cleanup() {
 # Trap signals
 trap cleanup SIGTERM SIGINT SIGQUIT
 
-echo "Starting MelodyFlow RQ worker..."
-python3 melodyflow_worker.py &
-worker_pid=$!
-
 echo "Starting MelodyFlow service..."
 python3 spaces_melodyflow.py &
 flask_pid=$!
