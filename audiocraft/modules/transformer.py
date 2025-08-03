@@ -20,7 +20,16 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
-from xformers import ops
+
+# Safe xformers import - make it completely optional
+try:
+    from xformers import ops
+    _has_xformers = True
+    print("✓ xformers available - using memory efficient attention when requested")
+except ImportError:
+    ops = None
+    _has_xformers = False
+    print("⚠️ xformers not available - falling back to PyTorch scaled_dot_product_attention")
 
 from .rope import RotaryEmbedding
 from .streaming import StreamingModule
@@ -31,7 +40,10 @@ _efficient_attention_backend: str = 'torch'
 def set_efficient_attention_backend(backend: str = 'torch'):
     # Using torch by default, it seems a bit faster on older P100 GPUs (~20% faster).
     global _efficient_attention_backend
-    assert _efficient_attention_backend in ['xformers', 'torch']
+    assert backend in ['xformers', 'torch']
+    if backend == 'xformers' and not _has_xformers:
+        print("⚠️ xformers backend requested but not available - falling back to torch")
+        backend = 'torch'
     _efficient_attention_backend = backend
 
 
@@ -44,11 +56,13 @@ def _get_attention_time_dimension(memory_efficient: bool) -> int:
 
 def _is_profiled() -> bool:
     # Return true if we are currently running with a xformers profiler activated.
+    if not _has_xformers:
+        return False
     try:
         from xformers.profiler import profiler
-    except ImportError:
+        return profiler._Profiler._CURRENT_PROFILER is not None
+    except (ImportError, AttributeError):
         return False
-    return profiler._Profiler._CURRENT_PROFILER is not None
 
 
 def create_norm_fn(norm_type: str, dim: int, **kwargs) -> nn.Module:
@@ -237,15 +251,27 @@ class StreamingMultiheadAttention(StreamingModule):
         # convention both in the builtin MHA in Pytorch, and Xformers functions.
         time_dim = _get_attention_time_dimension(self.memory_efficient)
         if self.memory_efficient:
-            from xformers.ops import LowerTriangularMask
-            if current_steps == 1:
-                # If we only have one step, then we do not need a mask.
-                return None
-            elif 'past_keys' in self._streaming_state:
-                raise RuntimeError("Not supported at the moment")
+            if _has_xformers:
+                from xformers.ops import LowerTriangularMask
+                if current_steps == 1:
+                    # If we only have one step, then we do not need a mask.
+                    return None
+                elif 'past_keys' in self._streaming_state:
+                    raise RuntimeError("Not supported at the moment")
+                else:
+                    # Then we can safely use a lower triangular mask
+                    return LowerTriangularMask()
             else:
-                # Then we can safely use a lower triangular mask
-                return LowerTriangularMask()
+                # Fallback: create manual causal mask for torch attention
+                if current_steps == 1:
+                    return None
+                elif 'past_keys' in self._streaming_state:
+                    raise RuntimeError("Not supported at the moment")  
+                else:
+                    # Create a lower triangular mask manually for torch's scaled_dot_product_attention
+                    # Return None and let is_causal=True handle it in scaled_dot_product_attention
+                    return None
+                    
         if self._streaming_state:
             past_keys = self._streaming_state['past_keys']
             past_steps = past_keys.shape[time_dim]
@@ -373,7 +399,13 @@ class StreamingMultiheadAttention(StreamingModule):
                     else:
                         bound_layout = "b t p h d"
                     packed = rearrange(projected, f"b t (p h d) -> {bound_layout}", p=3, h=self.num_heads)
-                    q, k, v = ops.unbind(packed, dim=2)
+                    if _has_xformers:
+                        q, k, v = ops.unbind(packed, dim=2)
+                    else:
+                        # Fallback: manual unbind - split along the p dimension (dim=2)
+                        q = packed[:, :, 0]  # First part
+                        k = packed[:, :, 1]  # Second part  
+                        v = packed[:, :, 2]  # Third part
                 else:
                     embed_dim = self.embed_dim
                     per_head_dim = (embed_dim // self.num_heads)
@@ -421,9 +453,11 @@ class StreamingMultiheadAttention(StreamingModule):
                         attn_mask = torch.nn.functional.pad(attn_mask, (1, 0))
 
                 p = self.dropout if self.training else 0
-                if _efficient_attention_backend == 'torch':
+                if not _has_xformers or _efficient_attention_backend == 'torch':
+                    # Use PyTorch's native scaled_dot_product_attention
+                    is_causal_mask = self.causal and attn_mask is None
                     x = torch.nn.functional.scaled_dot_product_attention(
-                        q, k, v, is_causal=self.causal, attn_mask=attn_mask, dropout_p=p)
+                        q, k, v, attn_mask=attn_mask, dropout_p=p, is_causal=is_causal_mask)
                 else:
                     x = ops.memory_efficient_attention(q, k, v, attn_mask, p=p)
             else:
@@ -694,27 +728,34 @@ class StreamingTransformer(StreamingModule):
         elif method == 'torch':
             return torch_checkpoint(layer, *args, use_reentrant=False, **kwargs)
         elif method.startswith('xformers'):
-            from xformers.checkpoint_fairinternal import checkpoint, _get_default_policy
-            if method == 'xformers_default':
-                # those operations will be saved, and not recomputed.
-                # According to Francisco we can get smarter policies but this is a good start.
-                allow_list = [
-                    "xformers.efficient_attention_forward_cutlass.default",
-                    "xformers_flash.flash_fwd.default",
-                    "aten.addmm.default",
-                    "aten.mm.default",
-                ]
-            elif method == 'xformers_mm':
-                # those operations will be saved, and not recomputed.
-                # According to Francisco we can get smarter policies but this is a good start.
-                allow_list = [
-                    "aten.addmm.default",
-                    "aten.mm.default",
-                ]
-            else:
-                raise ValueError(f"xformers checkpointing xformers policy {method} is not known.")
-            policy_fn = _get_default_policy(allow_list)
-            return checkpoint(layer, *args, policy_fn=policy_fn, **kwargs)
+            if not _has_xformers:
+                print("⚠️ xformers checkpointing requested but xformers not available - falling back to torch")
+                return torch_checkpoint(layer, *args, use_reentrant=False, **kwargs)
+            try:
+                from xformers.checkpoint_fairinternal import checkpoint, _get_default_policy
+                if method == 'xformers_default':
+                    # those operations will be saved, and not recomputed.
+                    # According to Francisco we can get smarter policies but this is a good start.
+                    allow_list = [
+                        "xformers.efficient_attention_forward_cutlass.default",
+                        "xformers_flash.flash_fwd.default",
+                        "aten.addmm.default",
+                        "aten.mm.default",
+                    ]
+                elif method == 'xformers_mm':
+                    # those operations will be saved, and not recomputed.
+                    # According to Francisco we can get smarter policies but this is a good start.
+                    allow_list = [
+                        "aten.addmm.default",
+                        "aten.mm.default",
+                    ]
+                else:
+                    raise ValueError(f"xformers checkpointing xformers policy {method} is not known.")
+                policy_fn = _get_default_policy(allow_list)
+                return checkpoint(layer, *args, policy_fn=policy_fn, **kwargs)
+            except ImportError:
+                print("⚠️ xformers checkpointing requested but fairinternal xformers not available - falling back to torch")
+                return torch_checkpoint(layer, *args, use_reentrant=False, **kwargs)
         else:
             raise ValueError(f"Checkpointing method {method} is unknown.")
 
@@ -758,31 +799,29 @@ class StreamingTransformer(StreamingModule):
 # special attention related function
 
 def _verify_xformers_memory_efficient_compat():
+    """Verify xformers memory efficient attention compatibility - now gracefully handles missing xformers."""
+    if not _has_xformers:
+        print("⚠️ Memory efficient attention requested, but xformers not installed. Using PyTorch scaled_dot_product_attention.")
+        return
+    
     try:
         from xformers.ops import memory_efficient_attention, LowerTriangularMask  # noqa
+        print("✓ xformers memory efficient attention available")
     except ImportError:
-        raise ImportError(
-            "xformers is not installed. Please install it and try again.\n"
-            "To install on AWS and Azure, run \n"
-            "FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST='8.0'\\\n"
-            "pip install -U git+https://git@github.com/fairinternal/xformers.git#egg=xformers\n"
-            "To install on FAIR Cluster, run \n"
-            "FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST='6.0;7.0'\\\n"
-            "pip install -U git+https://git@github.com/fairinternal/xformers.git#egg=xformers\n")
+        print("⚠️ xformers installed but memory_efficient_attention not available - using torch fallback")
 
 
 def _verify_xformers_internal_compat():
+    """Verify xformers internal checkpointing compatibility - now gracefully handles missing xformers."""
+    if not _has_xformers:
+        print("⚠️ xformers checkpointing requested, but xformers not installed. Using PyTorch checkpointing.")
+        return
+        
     try:
         from xformers.checkpoint_fairinternal import checkpoint, _get_default_policy  # noqa
+        print("✓ xformers fairinternal checkpointing available")
     except ImportError:
-        raise ImportError(
-            "Francisco's fairinternal xformers is not installed. Please install it and try again.\n"
-            "To install on AWS and Azure, run \n"
-            "FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST='8.0'\\\n"
-            "pip install -U git+https://git@github.com/fairinternal/xformers.git#egg=xformers\n"
-            "To install on FAIR Cluster, run \n"
-            "FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST='6.0;7.0'\\\n"
-            "pip install -U git+https://git@github.com/fairinternal/xformers.git#egg=xformers\n")
+        print("⚠️ xformers installed but fairinternal checkpointing not available - using torch fallback")
 
 
 def _is_custom(custom: bool, memory_efficient: bool):
