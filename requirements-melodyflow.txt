@@ -6,8 +6,6 @@ flask-socketio
 psutil
 
 # queue components
-redis
-rq
 
 
 # please make sure you have already a pytorch install that is cuda enabled!
@@ -38,3 +36,5 @@ torchvision
 torchtext
 pesq
 pystoi
+gevent
+gevent-websocket
