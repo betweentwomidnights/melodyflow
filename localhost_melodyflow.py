@@ -45,6 +45,29 @@ DEVICE = device
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('melodyflow')
 
+from flask import after_this_request
+
+def unload_model():
+    global model
+    if model is not None:
+        try:
+            del model
+        except:
+            pass
+        model = None
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except:
+            pass
+        torch.cuda.empty_cache()
+        # Optional extra cleanup on some systems:
+        try:
+            torch.cuda.ipc_collect()
+        except:
+            pass
+    gc.collect()
+
 class AudioProcessingError(Exception):
     """Custom exception for audio processing errors."""
     def __init__(self, message, status_code=400):
@@ -194,9 +217,31 @@ def process_audio(waveform: torch.Tensor, variation_name: str,
 @app.route('/transform', methods=['POST'])
 def transform_audio():
     """Handle audio transformation requests - simplified for localhost."""
+    output_file_path = None  # <-- declare early so cleanup hook can see it
+
     try:
-        session_id = None  # Initialize session_id
-        # Handle both file upload and JSON data
+        # Aggressive localhost cleanup: unload model after each request
+        AGGRESSIVE_UNLOAD = os.environ.get("MELODYFLOW_UNLOAD_EACH_REQUEST", "1") == "1"
+
+        if AGGRESSIVE_UNLOAD:
+            @after_this_request
+            def _cleanup(response):
+                # Remove generated WAV
+                try:
+                    if output_file_path and os.path.exists(output_file_path):
+                        os.remove(output_file_path)
+                except Exception as e:
+                    logger.warning(f"Failed to delete output wav: {e}")
+
+                # Unload model + clear GPU
+                unload_model()
+                return response
+
+        session_id = None
+
+        # ---------------------------------------------------------------------
+        # Handle both multipart form-data and JSON
+        # ---------------------------------------------------------------------
         if request.content_type and 'multipart/form-data' in request.content_type:
             # File upload mode
             if 'audio' not in request.files:
@@ -206,27 +251,23 @@ def transform_audio():
             if audio_file.filename == '':
                 return jsonify({'error': 'No audio file selected'}), 400
             
-            # Get form parameters
             variation = request.form.get('transformation_type', request.form.get('variation'))
             custom_flowstep = request.form.get('flowstep')
             solver = request.form.get('solver', 'euler')
             custom_prompt = request.form.get('prompt', request.form.get('custom_prompt'))
-            session_id = request.form.get('session_id')  # Get session_id from form
-            
-            # Save uploaded file temporarily
+            session_id = request.form.get('session_id')
+
             with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
                 audio_file.save(tmp_file.name)
                 temp_file_path = tmp_file.name
             
             try:
-                # Load audio from temp file
                 input_waveform = load_audio_from_file(temp_file_path)
             finally:
-                # Clean up temp file
                 os.unlink(temp_file_path)
-        
+
         else:
-            # JSON mode (for backward compatibility)
+            # JSON mode
             data = request.get_json()
             if not data or 'variation' not in data:
                 return jsonify({'error': 'Missing required data'}), 400
@@ -235,20 +276,17 @@ def transform_audio():
             custom_flowstep = data.get('flowstep')
             solver = data.get('solver', 'euler')
             custom_prompt = data.get('custom_prompt')
-            session_id = data.get('session_id')  # Get session_id from JSON
-            
-            # Check if we have audio file path
+            session_id = data.get('session_id')
+
             if 'audio_file_path' in data and data['audio_file_path']:
                 audio_file_path = data['audio_file_path']
-                print(f"[DEBUG] Audio file path: {audio_file_path}")
-                print(f"[DEBUG] File exists: {os.path.exists(audio_file_path)}")
                 input_waveform = load_audio_from_file(audio_file_path)
-                print(f"[DEBUG] Audio loaded successfully")
             else:
-                print("[ERROR] No audio data provided")
                 return jsonify({'error': 'No audio data provided'}), 400
 
+        # ---------------------------------------------------------------------
         # Validate parameters
+        # ---------------------------------------------------------------------
         if custom_flowstep is not None:
             try:
                 custom_flowstep = float(custom_flowstep)
@@ -260,9 +298,11 @@ def transform_audio():
         if solver not in ['euler', 'midpoint']:
             return jsonify({'error': 'Invalid solver. Must be "euler" or "midpoint"'}), 400
 
+        # ---------------------------------------------------------------------
         # Process audio
+        # ---------------------------------------------------------------------
         processed_waveform = process_audio(
-            input_waveform, 
+            input_waveform,
             variation,
             custom_flowstep,
             solver,
@@ -270,14 +310,14 @@ def transform_audio():
             session_id=session_id,
             progress_callback=redis_progress_callback
         )
-        
+
         import uuid
         output_filename = f"output_{session_id}_{uuid.uuid4().hex[:8]}.wav"
         output_file_path = os.path.join(SHARED_TEMP_DIR, output_filename)
 
         torchaudio.save(output_file_path, processed_waveform.cpu(), 32000)
 
-        # Clean up input tensor
+        # Explicit tensor cleanup (before model unload)
         del input_waveform
         del processed_waveform
 
@@ -290,6 +330,7 @@ def transform_audio():
 
     except AudioProcessingError as e:
         return jsonify({'error': str(e)}), e.status_code
+
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
