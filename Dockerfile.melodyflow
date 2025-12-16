@@ -23,6 +23,7 @@ RUN pip3 install -r requirements-melodyflow.txt gevent gevent-websocket
 
 # Copy application files
 COPY flask_melodyflow_2.py .
+COPY inspect_melodyflow.py .
 COPY variations.py .
 COPY audiocraft ./audiocraft
 
