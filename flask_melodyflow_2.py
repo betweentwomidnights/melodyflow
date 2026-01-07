@@ -13,6 +13,56 @@ from variations import VARIATIONS
 import logging
 import os
 from contextlib import contextmanager
+import json
+import redis
+
+import time
+from audiocraft.models.loaders import load_compression_model, load_dit_model_melodyflow
+
+def timed_get_pretrained(name: str = 'facebook/melodyflow-t24-30secs', device=None):
+    """Instrumented version to see where time is spent."""
+    if device is None:
+        if torch.cuda.device_count():
+            device = 'cuda'
+        else:
+            device = 'cpu'
+    
+    t0 = time.time()
+    logger.info("Loading compression model...")
+    compression_model = load_compression_model(name, device=device)
+    t1 = time.time()
+    logger.info(f"  → Compression model loaded in {t1-t0:.2f}s")
+    
+    logger.info("Removing weight norm...")
+    def _remove_weight_norm(module):
+        for m in module.modules():
+            if hasattr(m, "conv") and hasattr(m.conv, "conv"):
+                try:
+                    torch.nn.utils.parametrize.remove_parametrizations(m.conv.conv, "weight")
+                except: pass
+            if hasattr(m, "convtr") and hasattr(m.convtr, "convtr"):
+                try:
+                    torch.nn.utils.parametrize.remove_parametrizations(m.convtr.convtr, "weight")
+                except: pass
+    
+    _remove_weight_norm(compression_model)
+    compression_model.to(device)
+    t2 = time.time()
+    logger.info(f"  → Weight norm + device transfer in {t2-t1:.2f}s")
+    
+    logger.info("Loading DiT model...")
+    lm = load_dit_model_melodyflow(name, device=device)
+    t3 = time.time()
+    logger.info(f"  → DiT model loaded in {t3-t2:.2f}s")
+    
+    logger.info(f"TOTAL model load time: {t3-t0:.2f}s")
+    
+    return MelodyFlow(
+        name=name,
+        compression_model=compression_model,
+        lm=lm,
+        # target_device=device,        # <-- add this
+    )
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,11 +72,15 @@ app = Flask(__name__)
 app.start_time = time.time()
 CORS(app)
 
+# Redis setup - shared with g4lwebsockets
+redis_client = redis.StrictRedis(host='redis', port=6379, db=0)
+
 # Use gevent for WebSocket support
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
     async_mode='gevent',
+    message_queue='redis://redis:6379',  # Shared Redis with g4lwebsockets
     logger=True,
     engineio_logger=False,
 )
@@ -36,7 +90,7 @@ model = None
 model_last_used = None
 model_cleanup_timer = None
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-MODEL_TIMEOUT = 600  # 10 minutes to keep model warm
+MODEL_TIMEOUT = 1  # 10 minutes to keep model warm
 
 
 class AudioProcessingError(Exception):
@@ -161,7 +215,7 @@ def find_max_duration(
         test_waveform = waveform[..., :samples]
 
         try:
-            tokens = model.encode_audio(test_waveform)
+            tokens = model.encode_audio(test_waveform.to(model.device))
             token_length = tokens.shape[-1]
 
             if token_length <= max_token_length:
@@ -201,19 +255,45 @@ def process_audio(
             config['prompt'] = custom_prompt
 
         with resource_cleanup():
+            # Store warming status for HTTP clients BEFORE loading model
+            try:
+                redis_client.setex(
+                    f"status:{session_id}", 
+                    3600, 
+                    json.dumps({'status': 'warming', 'timestamp': time.time()})
+                )
+            except Exception as e:
+                logger.warning(f"Failed to store warming status in Redis: {e}")
+
             # Load or use cached model
             if model is None:
                 logger.info("Loading MelodyFlow model...")
-                model = MelodyFlow.get_pretrained(
-                    'facebook/melodyflow-t24-30secs',
-                    device=DEVICE,
-                )
+                
+                # Emit warming status once for WebSocket clients
+                try:
+                    socketio.emit(
+                        'queue_status',
+                        {
+                            'status': 'warming',
+                            'message': 'Loading MelodyFlow model...',
+                            'session_id': session_id,
+                        },
+                        room=session_id,
+                        namespace='/',
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to emit warming status: {e}")
+                
+                # Load the model (this takes time)
+                model = timed_get_pretrained('facebook/melodyflow-t24-30secs', device=DEVICE)
+                
+                logger.info("MelodyFlow model loaded")
             else:
                 logger.info("Using cached MelodyFlow model")
 
             # Update last used time and schedule cleanup
-            model_last_used = time.time()
-            schedule_model_cleanup()
+          #  model_last_used = time.time()
+          #  schedule_model_cleanup()
 
             # Find valid duration and get tokens
             max_valid_duration, tokens = find_max_duration(model, waveform)
@@ -244,10 +324,94 @@ def process_audio(
                 lambda_kl=0.2 if use_regularize else 0.0,
             )
 
+            # Only *after* all of that succeeds:
+            model_last_used = time.time()
+            schedule_model_cleanup()
+
+            # Track if we've transitioned to processing status
+            processing_status_set = False
+
             if progress_callback:
                 def model_progress_callback(elapsed_steps: int, total_steps: int):
+                    nonlocal processing_status_set
+                    
+                    progress_percent = min((elapsed_steps / total_steps) * 100, 99.9)
+                    
+                    # Store progress for HTTP polling clients
+                    try:
+                        redis_client.setex(f"progress:{session_id}", 3600, str(int(progress_percent)))
+                    except Exception as e:
+                        logger.warning(f"Failed to store progress in Redis: {e}")
+                    
+                    # Emit progress for WebSocket clients
+                    try:
+                        socketio.emit(
+                            'progress_update',
+                            {
+                                'progress': round(progress_percent, 2),
+                                'session_id': session_id,
+                            },
+                            room=session_id,
+                            namespace='/',
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to emit progress: {e}")
+                    
+                    # On first progress, transition from warming to processing
+                    if not processing_status_set and progress_percent > 0:
+                        try:
+                            redis_client.setex(
+                                f"status:{session_id}",
+                                3600,
+                                json.dumps({'status': 'processing', 'timestamp': time.time()})
+                            )
+                            processing_status_set = True
+                        except Exception as e:
+                            logger.warning(f"Failed to update processing status in Redis: {e}")
+                    
+                    # Also call the original callback if provided
                     progress_callback(elapsed_steps, total_steps)
 
+                model._progress_callback = model_progress_callback
+            else:
+                # Even without external callback, we need to emit progress
+                def model_progress_callback(elapsed_steps: int, total_steps: int):
+                    nonlocal processing_status_set
+                    
+                    progress_percent = min((elapsed_steps / total_steps) * 100, 99.9)
+                    
+                    # Store progress for HTTP polling clients
+                    try:
+                        redis_client.setex(f"progress:{session_id}", 3600, str(int(progress_percent)))
+                    except Exception as e:
+                        logger.warning(f"Failed to store progress in Redis: {e}")
+                    
+                    # Emit progress for WebSocket clients
+                    try:
+                        socketio.emit(
+                            'progress_update',
+                            {
+                                'progress': round(progress_percent, 2),
+                                'session_id': session_id,
+                            },
+                            room=session_id,
+                            namespace='/',
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to emit progress: {e}")
+                    
+                    # On first progress, transition from warming to processing
+                    if not processing_status_set and progress_percent > 0:
+                        try:
+                            redis_client.setex(
+                                f"status:{session_id}",
+                                3600,
+                                json.dumps({'status': 'processing', 'timestamp': time.time()})
+                            )
+                            processing_status_set = True
+                        except Exception as e:
+                            logger.warning(f"Failed to update processing status in Redis: {e}")
+                
                 model._progress_callback = model_progress_callback
 
             edited_audio = model.edit(
@@ -259,6 +423,8 @@ def process_audio(
             )
 
             return edited_audio[0][0]
+
+            
 
     except Exception as e:
         raise AudioProcessingError(f"Failed to process audio: {str(e)}")
@@ -301,15 +467,8 @@ def transform_audio():
             input_waveform = load_audio_from_base64(data['audio'])
 
         def progress_callback(current, total):
-            progress = min((current / total) * 100, 99.9)
-            socketio.emit(
-                'progress',
-                {
-                    'progress': round(progress, 2),
-                    'session_id': session_id,
-                },
-                namespace='/',
-            )
+            # This is called by process_audio's internal callback
+            # which already handles Redis storage and SocketIO emission
             socketio.sleep(0)
 
         processed_waveform = process_audio(
@@ -327,14 +486,25 @@ def transform_audio():
         del input_waveform
         del processed_waveform
 
-        socketio.emit(
-            'progress',
-            {
-                'progress': 100.0,
-                'session_id': session_id,
-            },
-            namespace='/',
-        )
+        # Emit 100% progress
+        try:
+            redis_client.setex(f"progress:{session_id}", 3600, "100")
+        except:
+            pass
+        
+        try:
+            socketio.emit(
+                'progress_update',
+                {
+                    'progress': 100.0,
+                    'session_id': session_id,
+                },
+                room=session_id,
+                namespace='/',
+            )
+        except:
+            pass
+        
         socketio.sleep(0)
 
         return jsonify(
